@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 模型文件（太大，不适合上传）
+models/
+*.gguf
+*.onnx
+*.bin
+
+# 捕获的图片和视频
+captures/
+camera_*.jpg
+camera_*.png
+*.mp4
+*.avi
+
+# 音频文件
+*.wav
+*.mp3
+test_output.wav
+tts_outputs/
+
+# 日志文件
+*.log
+*.jsonl
+camera_detection_results/
+
+# 配置文件（包含本地路径）
+monitor_config.json
+
+# 临时文件
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 测试输出
+test_output/
