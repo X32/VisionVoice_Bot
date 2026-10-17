@@ -78,6 +78,14 @@ class BaseLLMEndpoint(ABC):
         """健康检查"""
         pass
 
+    def warmup(self, keep_alive: str = "30m") -> float:
+        """预热：把模型加载进服务端内存（默认no-op，懒加载后端才实现）
+
+        Returns:
+            预热耗时（秒）；不支持时返回0.0。失败抛异常由调用方决定是否容忍。
+        """
+        return 0.0
+
     def _parse_choices(self, result: Dict, elapsed: float) -> LLMResponse:
         """解析OpenAI choices格式的响应（llama.cpp/OpenAI共用，含tool_calls）"""
         message = result["choices"][0]["message"]
@@ -244,6 +252,38 @@ class OllamaEndpoint(BaseLLMEndpoint):
             raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
         except (urllib.error.URLError, TimeoutError) as e:
             raise RuntimeError(f"连接失败: {e}") from e
+
+    def warmup(self, keep_alive: str = "30m") -> float:
+        """预热：触发ollama把模型加载进内存并常驻keep_alive
+
+        ollama是懒加载：首次请求要把模型权重读入内存（qwen2.5:7b约
+        数秒到十几秒），之后默认驻留5分钟。预热用一个最小请求
+        （num_predict=1）提前完成加载，语音对话首响应不再吃这笔延迟。
+
+        Args:
+            keep_alive: 模型驻留时长（如"5m"/"30m"/"-1"永久）。
+                之后每次真实请求都会刷新该计时。
+
+        Returns:
+            预热耗时（秒），含模型加载时间
+        """
+        payload = {
+            "model": self.model,
+            "prompt": "hi",
+            "stream": False,
+            "keep_alive": keep_alive,
+            "options": {"num_predict": 1, "temperature": 0.1},
+        }
+        req = urllib.request.Request(
+            f"{self.base_url}/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        start = time.time()
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            json.loads(resp.read().decode("utf-8"))   # 只关心状态，内容丢弃
+        return time.time() - start
 
     def chat(self, messages: List[Dict], tools: List = None, **kwargs) -> LLMResponse:
         """Ollama专用chat接口（支持多轮对话与function calling）
@@ -476,6 +516,10 @@ class LLM:
     def health_check(self) -> bool:
         """健康检查"""
         return self.endpoint.health_check()
+
+    def warmup(self, keep_alive: str = "30m") -> float:
+        """预热模型（懒加载后端有效，其余no-op）。返回预热耗时秒"""
+        return self.endpoint.warmup(keep_alive=keep_alive)
 
     def chat(self, messages: List[Dict], tools: List = None, **kwargs) -> LLMResponse:
         """

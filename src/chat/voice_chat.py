@@ -14,6 +14,8 @@
     python3 voice_chat.py --backend llama --url http://192.168.4.52:8080
     python3 voice_chat.py --no-tts                  # 仅文字显示，不播报
     python3 voice_chat.py --mute-tail 1.0           # 混响强的环境加大窗口
+    python3 voice_chat.py --wake-word 你好伙伴     # 自定义唤醒词（默认已启用）
+    python3 voice_chat.py --no-wake                 # 关闭唤醒，开放麦克风
 """
 import signal
 
@@ -42,10 +44,17 @@ sys.path.insert(0, str(PROJECT_ROOT / 'src/tts'))
 from unified_llm import LLM
 from vad_asr import SmartSpeakerASR
 from test_tts import TTS
+from player import ChunkedPlayer, resample_to_16k, trim_silence, with_primer
 
 MUTE_TAIL = 0.8   # 播放结束后的总静音窗口（秒）：覆盖设备输出缓冲+混响+
                   # VAD静音检测；实测本机回声残留约0.7s，0.8留少量余量
+MUTE_TAIL_INTERRUPTED = 0.3   # 被打断后的静音尾巴：短于正常值（用户等着继续说），
+                              # abort()已清输出缓冲，只需覆盖残余混响
+PRIMER_SILENCE = 0.5          # 播报前置牺牲静音：设备冷启动吃开头，让静音被吃
+SAMPLE_RATE_16K = 16000       # 播放统一采样率（与mic/AEC一致）
 MAX_TOOL_ROUNDS = 2   # 单次对话最多几轮工具调用（防模型无限要工具）
+DEFAULT_WAKE_WORD = "你好小迪"   # 默认唤醒词（learnPartner）
+WAKE_RESPONSE = "哎，我在"       # 唤醒应答语（启动时预合成，命中即播）
 
 
 # ================= Function Calling 工具注册表 =================
@@ -127,6 +136,14 @@ class VoiceChat:
         history_limit: int = 10,
         mute_tail: float = MUTE_TAIL,
         use_tools: bool = True,
+        wake_words: list = None,
+        wake_threshold: float = 0.25,
+        active_timeout: float = 30.0,
+        barge_in: bool = True,
+        barge_threshold: float = 0.7,
+        stop_words: list = None,
+        barge_long_speech: float = 1.2,
+        barge_kws_threshold: float = 0.25,
         debug: bool = False
     ):
         """
@@ -140,6 +157,14 @@ class VoiceChat:
             history_limit: 对话历史保留轮数
             mute_tail: 混响尾巴时长（秒）
             use_tools: 是否启用function calling
+            wake_words: 唤醒词列表（None=开放麦克风模式）
+            wake_threshold: 唤醒词命中阈值
+            active_timeout: 唤醒后无语音休眠时间（秒）
+            barge_in: 启用打断检测（播报中插话→停播）
+            barge_threshold: 长语音通道silero阈值
+            stop_words: 停止词表（命中即打断；唤醒词自动并入）
+            barge_long_speech: 连续语音超此秒数视为新问题打断
+            barge_kws_threshold: 停止词KWS阈值
             debug: 调试模式
         """
         self.debug = debug
@@ -151,13 +176,39 @@ class VoiceChat:
         print("🧠 初始化大模型...")
         self.llm = LLM(**llm_config)
 
+        # 模型预热（后台线程）：ollama懒加载，首次请求要数秒~十几秒把
+        # 模型读进内存；趁ASR/TTS还在初始化时提前加载，首句对话不吃这笔
+        # 延迟。失败不致命（服务没起时提示后继续，首个真实请求会再报错）
+        def _warmup():
+            try:
+                t = self.llm.warmup()
+                print(f"🔥 模型预热完成（{t:.1f}s，已常驻）")
+            except Exception as e:
+                print(f"⚠️  模型预热失败: {e}")
+        threading.Thread(target=_warmup, daemon=True).start()
+
         # 初始化ASR（识别回调只递纸条，微秒级返回，不阻塞麦克风采集）
         print("🎤 初始化语音识别...")
         self.asr = SmartSpeakerASR(
             on_text=self.on_user_text,
+            wake_words=wake_words,
+            wake_threshold=wake_threshold,
+            active_timeout=active_timeout,
+            on_wake=self.on_wake,
+            on_sleep=self.on_sleep,
+            barge_in=barge_in,
+            on_barge_in=self.on_barge_in,
+            barge_threshold=barge_threshold,
+            stop_words=stop_words,
+            barge_long_speech=barge_long_speech,
+            barge_kws_threshold=barge_kws_threshold,
             **asr_config,
             debug=debug
         )
+
+        # 流式播放器（打断的停播执行者；R3流式TTS复用）
+        self.player = ChunkedPlayer()
+        self.interrupted = False
 
         # 初始化TTS（如果需要）
         self.tts = None
@@ -172,6 +223,16 @@ class VoiceChat:
                 print(f"⚠️  TTS初始化失败: {e}")
                 print("💡 将使用文字模式运行")
                 self.tts = None
+
+        # 唤醒应答音频预合成（命中唤醒词即播，避免现场合成的延迟）
+        self.wake_audio = None
+        if wake_words and self.tts:
+            try:
+                print("🔔 预合成唤醒应答...")
+                result = self.tts.speak(WAKE_RESPONSE, play=False, verbose=False)
+                self.wake_audio = (result['samples'], result['sample_rate'])
+            except Exception as e:
+                print(f"⚠️  唤醒应答预合成失败（唤醒后无提示音）: {e}")
 
         # 对话历史
         self.history = [
@@ -188,6 +249,46 @@ class VoiceChat:
         if text.strip():
             self.text_q.put(text)
 
+    def on_wake(self, word: str):
+        """唤醒回调（在mic_loop线程调用）：播预合成的应答短句
+
+        与worker的TTS播报同样走回声门控（mute→播→unmute带尾巴），
+        否则应答音会被自己识别成指令。走ChunkedPlayer统一播放路径。
+        """
+        if self.wake_audio is None:
+            print("💡 请讲（无提示音）")
+            return
+        samples, sample_rate = self.wake_audio
+        self.asr.mute()
+        try:
+            self.asr.set_playing(True)
+            try:
+                samples16 = with_primer(
+                    trim_silence(resample_to_16k(samples, sample_rate),
+                                 SAMPLE_RATE_16K),
+                    SAMPLE_RATE_16K, PRIMER_SILENCE)
+                self.player.play(samples16,
+                                 on_chunk=self.asr.feed_reference)
+            finally:
+                self.asr.set_playing(False)
+        finally:
+            self.asr.unmute(tail=self.mute_tail)
+
+    def on_sleep(self):
+        """休眠回调（在mic_loop线程调用）：目前仅日志"""
+        print("💤 说唤醒词可再次唤醒")
+
+    def on_barge_in(self, reason: str):
+        """打断回调（在mic_loop线程调用）：停播+置标记
+
+        reason: 'stop_word:停'（停止词/唤醒词命中）或 'long_speech'
+        （长语音=新问题）。player.stop()经abort()清输出缓冲立即静音
+        （实测3ms内）；worker的play()随即返回False，据interrupted标记写历史。
+        """
+        print(f"\n[{time.time():.3f}] ✋ 打断({reason})，停止播报")
+        self.interrupted = True
+        self.player.stop()
+
     def worker(self):
         """工作线程：串行消费队列，处理 LLM+TTS（重活全在这里）"""
         while True:
@@ -202,22 +303,50 @@ class VoiceChat:
                 print(f"🤖 回答: {resp.text}")
                 print(f"⏱️  耗时: {resp.elapsed:.2f}s")
 
-                self.history.append({"role": "assistant", "content": resp.text})
-                self._trim_history()
-
-                # TTS播报：门控开 → 播放 → 门控关（带静音窗口+VAD重置）
+                # TTS播报：门控开 → 合成 → 流式播放（可被打断）→ 门控关
+                # 历史在播报后写入：被打断时加标记（模型能答"刚才说到哪"）
+                assistant_text = resp.text
+                interrupted = False
                 if self.tts:
                     self.asr.mute()                       # ① 门控开（合成前）
                     try:
                         speak_text = tts_sanitize(resp.text)   # 年份等读法修正
                         print(f"[{time.time():.3f}] 🔊 语音播报中...")
-                        self.tts.speak(speak_text)        # ② 合成+播放（阻塞）
-                        print(f"[{time.time():.3f}] 🔈 播放完成")
+                        result = self.tts.speak(speak_text, play=False,
+                                                verbose=False)
+                        # 垫头：0.5s牺牲静音——声卡power_save休眠后下次
+                        # 播放开头~0.5s在唤醒codec，让静音被吃而非语音；
+                        # 修剪：安全网，防个别合成结果带长静音
+                        samples16 = resample_to_16k(result['samples'],
+                                                    result['sample_rate'])
+                        samples16 = with_primer(
+                            trim_silence(samples16, SAMPLE_RATE_16K),
+                            SAMPLE_RATE_16K, PRIMER_SILENCE)
+                        self.interrupted = False
+                        self.asr.set_playing(True)
+                        try:
+                            # ② 分块播放：每块回调far-end参考给AEC；
+                            #    插话→on_barge_in→player.stop()→此处返回False
+                            complete = self.player.play(
+                                samples16, on_chunk=self.asr.feed_reference)
+                        finally:
+                            self.asr.set_playing(False)
+                        if complete:
+                            print(f"[{time.time():.3f}] 🔈 播放完成")
+                        else:
+                            interrupted = self.interrupted
+                            print(f"[{time.time():.3f}] ✋ 播报被打断")
                     finally:
-                        # ③ 门控关：播放结束后保留 mute_tail 秒静音窗口
-                        #    （覆盖设备输出缓冲+混响，实测回声残留约0.7s），
-                        #    窗口到期后VAD重置，恢复干净收音
-                        self.asr.unmute(tail=self.mute_tail)
+                        # ③ 门控关：保留静音窗口覆盖输出缓冲+混响。
+                        #    被打断用短尾巴（abort已清缓冲，用户等着说话）
+                        tail = MUTE_TAIL_INTERRUPTED if interrupted \
+                            else self.mute_tail
+                        self.asr.unmute(tail=tail)
+
+                if interrupted:
+                    assistant_text = resp.text + "（被用户打断）"
+                self.history.append({"role": "assistant", "content": assistant_text})
+                self._trim_history()
 
             except Exception as e:
                 print(f"❌ 处理出错: {e}")
@@ -300,7 +429,11 @@ class VoiceChat:
         print("\n" + "=" * 60)
         print("🎯 智能语音对话助手")
         print("=" * 60)
-        print("💡 直接说话即可，助手会自动识别、思考并语音回复")
+        if self.asr.wake is not None:
+            print(f"🔔 说唤醒词唤醒: {' / '.join(self.asr.wake.keywords)}")
+            print(f"💤 {self.asr.active_timeout:.0f}秒无语音自动休眠")
+        else:
+            print("💡 直接说话即可，助手会自动识别、思考并语音回复")
         print("🛑 按 Ctrl+C 退出")
         print("=" * 60)
         print()
@@ -400,6 +533,31 @@ def main():
     parser.add_argument('--no-tools', action='store_true',
                        help='禁用function calling（纯对话模式）')
 
+    # 唤醒词参数
+    parser.add_argument('--wake-word', '-w', type=str, action='append',
+                       metavar='WORD',
+                       help=f'唤醒词（可多次指定多个；默认 "{DEFAULT_WAKE_WORD}"）')
+    parser.add_argument('--no-wake', action='store_true',
+                       help='关闭唤醒词，开放麦克风模式（任何语音都触发识别）')
+    parser.add_argument('--wake-threshold', type=float, default=0.25,
+                       help='唤醒词命中阈值，越低越灵敏误唤醒越高（默认0.25）')
+    parser.add_argument('--active-timeout', type=float, default=30.0,
+                       help='唤醒后无语音自动休眠时间（秒，默认30）')
+
+    # 打断参数
+    parser.add_argument('--no-barge-in', action='store_true',
+                       help='禁用打断检测（播报期间插话无效，回到纯门控）')
+    parser.add_argument('--barge-threshold', type=float, default=0.7,
+                       help='长语音通道silero阈值（默认0.7，离线实测误报最优）')
+    parser.add_argument('--stop-words', type=str, action='append',
+                       metavar='WORD',
+                       help='停止词（可多次指定；默认 不要说了/闭嘴，唤醒词自动并入；'
+                            '单词如"停"KWS检不出，请用三音节以上）')
+    parser.add_argument('--barge-long-speech', type=float, default=1.2,
+                       help='连续语音超过此秒数视为新问题打断（默认1.2）')
+    parser.add_argument('--barge-kws-threshold', type=float, default=0.25,
+                       help='停止词KWS阈值（"停"误报多时调高，默认0.25）')
+
     # ASR参数（透传）
     parser.add_argument('--vad-duration', type=float, default=8.0,
                        help='单段最大录音时长（秒）')
@@ -439,7 +597,8 @@ def main():
     print("🎙️ 智能语音对话助手")
     print("=" * 60)
 
-    # 创建语音助手
+    # 创建语音助手（--no-wake回到开放麦克风；否则默认启用唤醒词）
+    wake_words = None if args.no_wake else (args.wake_word or [DEFAULT_WAKE_WORD])
     voice_chat = VoiceChat(
         llm_config=llm_config,
         asr_config=asr_config,
@@ -448,6 +607,14 @@ def main():
         history_limit=args.history,
         mute_tail=args.mute_tail,
         use_tools=not args.no_tools,
+        wake_words=wake_words,
+        wake_threshold=args.wake_threshold,
+        active_timeout=args.active_timeout,
+        barge_in=not args.no_barge_in,
+        barge_threshold=args.barge_threshold,
+        stop_words=args.stop_words,
+        barge_long_speech=args.barge_long_speech,
+        barge_kws_threshold=args.barge_kws_threshold,
         debug=args.vad_debug
     )
 
