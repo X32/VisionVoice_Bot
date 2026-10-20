@@ -328,6 +328,27 @@ class SmartSpeakerASR:
         if self.debug:
             print(f"[{time.time():.3f}] 🔊 回声抑制关闭，{tail:.1f}s后恢复收音")
 
+    def enter_standby(self):
+        """语音口令主动待机：立即回到idle（区别于超时休眠的主动出口）
+
+        在ASR识别回调线程（mic_loop）中调用。复位序列与超时休眠路径
+        一致：清VAD残留段落防待机瞬间弹出旧音频，KWS复位重新监听唤醒词。
+        开放麦克风模式（wake为None）不响应——待机后没有唤醒KWS，等于失聪。
+        """
+        if self.wake is None:
+            return
+        self.state = 'idle'
+        self.vad.reset()
+        while not self.vad.empty():
+            self.vad.pop()
+        self.in_speech = False
+        self.wake.reset()
+        if self.on_sleep:
+            try:
+                self.on_sleep()
+            except Exception as e:
+                print(f"⚠️  on_sleep回调出错: {e}")
+
     def recognize_and_display(self, samples: np.ndarray, t_emit: float = 0.0):
         """识别音频并显示结果（门控/冷却检查已在上游 mic_loop 完成）"""
         audio_duration = len(samples) / SAMPLE_RATE

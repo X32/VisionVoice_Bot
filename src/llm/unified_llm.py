@@ -118,9 +118,97 @@ class BaseLLMEndpoint(ABC):
             tool_calls=tool_calls
         )
 
+    def _openai_chat_stream(self, messages: List[Dict], tools: List = None,
+                            extra_headers: Dict = None, **kwargs):
+        """OpenAI兼容SSE流式chat（llama.cpp/OpenAI端点共用）
+
+        逐块产出事件dict：
+          {"delta": str}                          增量文本
+          {"done": True, "text": 全文, "usage":}  流结束（收尾统计）
+        tool_calls以增量片段跨块到达，聚齐后在流末尾作为事件产出。
+
+        消费方break或close()本生成器 → finally关闭HTTP连接 →
+        服务端中止后续生成（ollama实测断连即取消，llama.cpp同机制）。
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": kwargs.get('max_tokens', self.max_tokens),
+            "temperature": kwargs.get('temperature', self.temperature),
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        headers = {"Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+
+        req = urllib.request.Request(
+            f"{self.base_url}{self._completions_path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers, method="POST")
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                err_body = "(无法读取错误响应体)"
+            raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            raise RuntimeError(f"连接失败: {e}") from e
+
+        try:
+            full = []
+            tool_acc = {}   # index -> {"id","name","arguments"}片段聚合
+            for raw in resp:
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue   # SSE注释行/空行
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    full.append(delta["content"])
+                    yield {"delta": delta["content"]}
+                for tc in delta.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    acc = tool_acc.setdefault(
+                        tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+                    acc["id"] += tc.get("id") or ""
+                    acc["name"] += fn.get("name") or ""
+                    acc["arguments"] += fn.get("arguments") or ""
+            if tool_acc:
+                calls = []
+                for acc in tool_acc.values():
+                    args = acc["arguments"] or "{}"
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"_raw": args}
+                    calls.append({"id": acc["id"], "name": acc["name"],
+                                  "arguments": args})
+                yield {"tool_calls": calls}
+                return
+            yield {"done": True, "text": "".join(full), "usage": {}}
+        finally:
+            resp.close()
+
 
 class LlamaCPPEndpoint(BaseLLMEndpoint):
     """llama.cpp端点"""
+
+    _completions_path = "/v1/chat/completions"
 
     def __init__(self, base_url: str = "http://localhost:8080",
                  model: str = "qwen2.5-vl-3b", **kwargs):
@@ -176,6 +264,10 @@ class LlamaCPPEndpoint(BaseLLMEndpoint):
                 return resp.status == 200
         except Exception:
             return False
+
+    def chat_stream(self, messages: List[Dict], tools: List = None, **kwargs):
+        """流式chat（SSE），事件格式见 _openai_chat_stream"""
+        return self._openai_chat_stream(messages, tools=tools, **kwargs)
 
 
 class OllamaEndpoint(BaseLLMEndpoint):
@@ -363,9 +455,92 @@ class OllamaEndpoint(BaseLLMEndpoint):
         except Exception:
             return False
 
+    def chat_stream(self, messages: List[Dict], tools: List = None, **kwargs):
+        """流式chat：NDJSON逐行事件生成器（R3流式响应）
+
+        逐块产出事件dict：
+          {"delta": str}                          增量文本
+          {"tool_calls": [...]}                   工具调用决议（同chat()解析格式）
+          {"done": True, "text": 全文, "usage":}  流结束
+
+        实测（qwen2.5:7b）：文本增量每token一行；tool_calls是完整对象随
+        某块到达（首块即到且content为空）——命中即产出并结束流。
+        消费方break或close()本生成器 → finally关闭连接 → ollama实测
+        断连即取消生成（后续请求0.13s响应，不会排队等旧生成烧完）。
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "num_predict": kwargs.get('max_tokens', self.max_tokens),
+                "temperature": kwargs.get('temperature', self.temperature),
+            }
+        }
+        if tools:
+            payload["tools"] = tools
+
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8")
+            except Exception:
+                err_body = "(无法读取错误响应体)"
+            raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            raise RuntimeError(f"连接失败: {e}") from e
+
+        try:
+            full = []
+            for raw in resp:
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                msg = obj.get("message") or {}
+                # 工具调用优先判定（与content互斥出现，qwen工具轮content为空）
+                if msg.get("tool_calls"):
+                    tool_calls = [
+                        {
+                            "id": tc.get("id", ""),
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"].get("arguments") or {},
+                        }
+                        for tc in msg["tool_calls"]
+                    ]
+                    yield {"tool_calls": tool_calls}
+                    return   # 关闭连接 → 服务端取消生成
+                content = msg.get("content") or ""
+                if content:
+                    full.append(content)
+                    yield {"delta": content}
+                if obj.get("done"):
+                    usage = {
+                        "prompt_tokens": obj.get("prompt_eval_count", 0),
+                        "completion_tokens": obj.get("eval_count", 0),
+                        "total_tokens": obj.get("eval_count", 0)
+                                        + obj.get("prompt_eval_count", 0),
+                    }
+                    yield {"done": True, "text": "".join(full), "usage": usage}
+                    return
+            # 服务端未发done就断流：以已收内容收尾（防御）
+            yield {"done": True, "text": "".join(full), "usage": {}}
+        finally:
+            resp.close()
+
 
 class OpenAIEndpoint(BaseLLMEndpoint):
     """OpenAI兼容API端点（远程大模型）"""
+
+    _completions_path = "/chat/completions"   # base_url已含/v1
 
     def __init__(self, base_url: str, model: str, api_key: str = None,
                  timeout: int = 120, **kwargs):
@@ -416,6 +591,14 @@ class OpenAIEndpoint(BaseLLMEndpoint):
             raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
         except (urllib.error.URLError, TimeoutError) as e:
             raise RuntimeError(f"连接失败: {e}") from e
+
+    def chat_stream(self, messages: List[Dict], tools: List = None, **kwargs):
+        """流式chat（SSE），事件格式见 _openai_chat_stream"""
+        headers = None
+        if self.api_key:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+        return self._openai_chat_stream(messages, tools=tools,
+                                        extra_headers=headers, **kwargs)
 
     def health_check(self) -> bool:
         """OpenAI兼容API健康检查"""
@@ -539,6 +722,21 @@ class LLM:
         else:
             # OpenAI和llama.cpp使用标准messages格式
             return self.endpoint.generate("", messages=messages, tools=tools, **kwargs)
+
+    def chat_stream(self, messages: List[Dict], tools: List = None, **kwargs):
+        """流式对话（R3）：生成器逐块产出事件dict
+
+          {"delta": str}                          增量文本
+          {"tool_calls": [...]}                   工具调用决议（格式同chat()）
+          {"done": True, "text": 全文, "usage":}  流结束统计
+
+        用法:
+            gen = llm.chat_stream(messages)
+            for ev in gen:
+                if "delta" in ev: ...
+            # 提前break后务必 gen.close() → 关闭HTTP连接 → 服务端取消生成
+        """
+        return self.endpoint.chat_stream(messages, tools=tools, **kwargs)
 
     def _format_messages_to_prompt(self, messages: List[Dict]) -> str:
         """将消息格式转换为单prompt（Ollama使用）"""

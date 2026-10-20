@@ -1,23 +1,46 @@
 #!/usr/bin/env python3
 """
-摄像头定时采集 + VLM 分析程序
-每隔一段时间从摄像头采集一张图片，发送到 llama-server (Qwen2.5-VL) 进行分析
+摄像头定时采集 + VLM 分析服务（摸鱼判定服务）
 
-配置文件: monitor_config.json (采集间隔、prompt、服务器地址等都在里面改)
+引擎：每隔一段时间从摄像头采集一张图片，发送到 llama-server (Qwen2.5-VL)
+分析，判定 工作/摸鱼/离开。可作独立CLI跑，也可作为HTTP+WebSocket服务跑，
+供对话程序等其他进程查询状态与接收实时事件。
 
 用法:
-    python camera_vlm_monitor.py                      # 使用 monitor_config.json
-    python camera_vlm_monitor.py --config my.json     # 指定其他配置文件
-    python camera_vlm_monitor.py --interval 5         # 命令行临时覆盖采集间隔(秒)
-    python camera_vlm_monitor.py --prompt "图里有什么" # 命令行临时覆盖 prompt
+    python camera_vlm_monitor.py                      # 服务模式（默认，:8300）
+    python camera_vlm_monitor.py --port 8301          # 换端口
+    python camera_vlm_monitor.py --no-serve           # 纯CLI循环（原行为）
     python camera_vlm_monitor.py --once               # 只采集分析一次(测试用)
+    python camera_vlm_monitor.py --interval 5         # 命令行临时覆盖采集间隔(秒)
+    python camera_vlm_monitor.py --config my.json     # 指定其他配置文件
+
+HTTP接口（只读）:
+    GET /api/status          当前状态快照（状态/持续/今日统计/最近一条）
+    GET /api/history?limit=20  最近N条分析记录（新→旧）
+    GET /healthz             存活探针
+
+WebSocket /ws（双向）:
+    连接即推 {"type":"hello", 快照}；此后服务端推送:
+      {"type":"analysis",      ...}   每轮分析结果
+      {"type":"status_change", ...}   状态翻转（工作↔摸鱼↔离开）
+      {"type":"error",         ...}   采集/分析失败
+      {"type":"pong"}                 应答ping
+    客户端可发:
+      {"type":"capture_now"}            立即采集分析一轮
+      {"type":"set_interval","seconds":30}
+      {"type":"pause"} / {"type":"resume"}
+      {"type":"ping"}
 """
 import argparse
+import asyncio
 import base64
 import json
+import queue
 import re
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +81,10 @@ DEFAULT_CONFIG = {
         "max_side": 640,      # 发送前把长边缩到此像素，控制图片 token 数
         "retries": 2,         # 请求失败重试次数
         "retry_delay": 5,     # 首次重试等待秒数(之后指数翻倍, 上限30s)
+    },
+    "server": {
+        "host": "0.0.0.0",    # 监听地址（局域网可访问）
+        "port": 8300,
     },
 }
 
@@ -273,8 +300,390 @@ def analyze_with_retry(data_url: str, prompt: str, vlm_cfg: dict) -> dict:
             delay = min(delay * 2, 30)  # 重试间隔指数退避，上限30s
 
 
+# ============================ 监控引擎 ============================
+
+class MonitorEngine:
+    """定时采集→VLM分析→状态判定（独立线程，可接收命令）
+
+    线程模型：run()在自己的线程执行（cv2/urllib都是阻塞调用，不进asyncio
+    事件循环）；命令经command_q提交（线程安全），_wake事件打断interval
+    等待使命令立即生效。on_event回调在引擎线程调用——server侧负责跨线程
+    投递进asyncio（loop.call_soon_threadsafe）。
+    """
+
+    def __init__(self, config: dict, on_event=None, once: bool = False):
+        self.config = config
+        self.cam_cfg = config["camera"]
+        self.cap_cfg = config["capture"]
+        self.vlm_cfg = config["vlm"]
+        self.on_event = on_event
+        self.once = once
+
+        self.command_q: queue.Queue = queue.Queue()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._paused = False
+        self._lock = threading.Lock()      # 保护下面的快照状态
+
+        self._interval = float(self.cap_cfg["interval"])
+        self._status: str | None = None    # 当前判定（None=尚无有效判定）
+        self._status_since = time.time()   # 当前状态开始的时刻
+        self._last_change: float | None = None
+        self._counts = {"工作": 0, "摸鱼": 0, "离开": 0}
+        self._records: deque = deque(maxlen=100)   # 内存历史（/api/history）
+        self._cycle = 0
+        self._fail_count = 0               # 连续采集失败计数
+        self._camera_ok = False
+        self._t_start: float | None = None
+
+        self._cap = None
+        self._log_file: Path | None = None
+
+    # ---------- 对外接口（任意线程调用） ----------
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True,
+                         name="monitor-engine").start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+
+    def submit(self, cmd: dict):
+        """投递命令：capture_now / set_interval / pause / resume"""
+        self.command_q.put(cmd)
+        self._wake.set()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "status": self._status,
+                "status_since": self._status_since,
+                "last_change": self._last_change,
+                "duration": time.time() - self._status_since
+                            if self._status else None,
+                "today": dict(self._counts),
+                "cycle": self._cycle,
+                "camera_ok": self._camera_ok,
+                "paused": self._paused,
+                "interval": self._interval,
+                "uptime": time.time() - self._t_start if self._t_start else 0,
+                "last_record": self._records[-1] if self._records else None,
+            }
+
+    def history(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            recs = list(self._records)
+        return list(reversed(recs))[:max(1, limit)]
+
+    # ---------- 引擎主循环（引擎线程） ----------
+
+    def run(self):
+        self._t_start = time.time()
+        output_dir = Path(self.cap_cfg["output_dir"])
+        # 无论是否存图都要建目录：JSONL日志写在同一处
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._log_file = output_dir / \
+            f"analysis_{datetime.now().strftime('%Y%m%d')}.jsonl"
+
+        self._open_camera()
+        try:
+            while not self._stop.is_set():
+                loop_start = time.time()
+                self._cycle += 1
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                print(f"\n--- 第 {self._cycle} 次采集 [{timestamp}] ---")
+
+                if self._cap is None:
+                    self._open_camera()   # 上轮重开失败，本轮再试
+                frame = self._capture_frame(timestamp) if self._cap else None
+
+                if frame is not None:
+                    self._analyze_frame(frame, timestamp, output_dir)
+
+                if self.once or self._stop.is_set():
+                    break
+
+                self._maybe_cleanup()
+                self._sleep_until_next(loop_start)
+        finally:
+            if self._cap is not None:
+                self._cap.release()
+            print_summary(self._counts, self._log_file)
+
+    def _open_camera(self):
+        """打开摄像头；失败不退出进程（服务模式要活着报错误事件）"""
+        try:
+            cap = open_camera(self.cam_cfg)
+        except SystemExit:
+            cap = None
+        if cap is None:
+            self._camera_ok = False
+            print("⚠️ 摄像头不可用，下一轮重试")
+            return
+        self._cap = cap
+        self._camera_ok = True
+        self._fail_count = 0
+
+    def _capture_frame(self, timestamp: str):
+        frame = capture_frame(self._cap, self.cam_cfg["warmup_frames"])
+        if frame is None:
+            self._fail_count += 1
+            print(f"❌ 采集失败 (连续第 {self._fail_count} 次)")
+            if self._fail_count >= 3:
+                print("🔄 尝试重新打开摄像头...")
+                self._cap.release()
+                self._cap = None
+                time.sleep(2)
+                self._open_camera()
+                self._fail_count = 0 if self._cap else 2
+            self._record({"timestamp": timestamp, "cycle": self._cycle,
+                          "status": None, "error": "采集失败"}, emit_error="采集失败")
+        return frame
+
+    def _analyze_frame(self, frame, timestamp: str, output_dir: Path):
+        image_path = None
+        if self.cap_cfg["save_image"]:
+            image_path = output_dir / f"img_{timestamp}.jpg"
+            cv2.imwrite(str(image_path), frame)
+            print(f"📸 已保存: {image_path}")
+
+        try:
+            data_url, side = frame_to_data_url(frame, self.vlm_cfg["max_side"])
+            print(f"📤 发送分析请求 (长边 {side}px)...")
+            result = analyze_with_retry(data_url, self.vlm_cfg["prompt"],
+                                       self.vlm_cfg)
+
+            content = result["choices"][0]["message"]["content"]
+            usage = result.get("usage", {})
+            elapsed = result["_elapsed"]
+            tokens = usage.get("completion_tokens", 0)
+            tps = tokens / elapsed if elapsed > 0 else 0
+
+            status = parse_status(content)
+            emoji = STATUS_EMOJI.get(status, "") if status else ""
+            print(f"\n{emoji} 状态判定: 【{status}】" if status
+                  else "\n⚠️  未能解析状态")
+            print(f"💬 分析结果:\n{content}")
+            print(f"⏱️  {elapsed:.2f}s | {tokens} tokens | {tps:.1f} tok/s")
+
+            record = {
+                "timestamp": timestamp,
+                "cycle": self._cycle,
+                "status": status,
+                "image": str(image_path) if image_path else None,
+                "prompt": self.vlm_cfg["prompt"],
+                "response": content,
+                "elapsed": round(elapsed, 2),
+                "usage": usage,
+            }
+            self._record(record, new_status=status)
+        except Exception as e:
+            print(f"❌ 分析失败: {type(e).__name__}: {e}")
+            print("   (继续下一轮采集)")
+            self._record({"timestamp": timestamp, "cycle": self._cycle,
+                          "status": None, "error": str(e)}, emit_error=str(e))
+
+    def _record(self, record: dict, new_status: str | None = None,
+                emit_error: str | None = None):
+        """记录入内存+JSONL日志，按需发事件（引擎线程调用）"""
+        if emit_error is None:
+            record["ts"] = time.time()
+        with self._lock:
+            self._records.append(record)
+            if record.get("status"):
+                self._counts[record["status"]] += 1
+            prev = self._status
+            # 翻转=有旧状态且变了（首次判定不算，hello快照已覆盖）
+            flip = (new_status is not None and prev is not None
+                    and new_status != prev)
+            if new_status and new_status != prev:
+                self._last_change = time.time()
+                self._status_since = self._last_change
+                self._status = new_status
+        if self._log_file is not None:
+            try:
+                with open(self._log_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError as e:
+                print(f"⚠️ 日志写入失败(不影响监控): {e}")
+        now = record.get("ts", time.time())
+        if emit_error is not None:
+            self._emit({"type": "error", "ts": now,
+                        "cycle": self._cycle, "error": emit_error})
+            return
+        self._emit({"type": "analysis", "ts": now,
+                    "cycle": self._cycle, "status": record.get("status"),
+                    "response": record.get("response", "")[:500],
+                    "elapsed": record.get("elapsed")})
+        if flip:
+            self._emit({"type": "status_change", "ts": now,
+                        "from": prev, "to": new_status})
+
+    def _emit(self, msg: dict):
+        if self.on_event is not None:
+            try:
+                self.on_event(msg)
+            except Exception as e:
+                print(f"⚠️ 事件回调出错: {e}")
+
+    def _maybe_cleanup(self):
+        interval_cycles = max(1, self.config["storage"]["cleanup_interval_cycles"])
+        if self._cycle % interval_cycles == 0:
+            try:
+                cleanup_images(Path(self.cap_cfg["output_dir"]),
+                               self.config["storage"])
+            except OSError as e:
+                print(f"⚠️ 图片清理出错(不影响监控): {e}")
+
+    def _sleep_until_next(self, loop_start: float):
+        """等到下轮时刻；期间消费命令（capture_now立即返回）
+
+        暂停时只等命令不长睡（resume命令能立刻生效）；resume后下轮
+        锚点重定为当前时刻（否则会补等暂停前剩余的旧间隔，语义怪异）。
+        """
+        was_paused = self._paused
+        while not self._stop.is_set():
+            if self._paused:
+                was_paused = True
+                self._wake.wait(timeout=0.5)
+                self._wake.clear()
+                self._drain_commands()
+                continue
+            if was_paused:   # 刚恢复：锚点重定为现在，间隔从头计
+                loop_start = time.time()
+                was_paused = False
+            remain = loop_start + self._interval - time.time()
+            if remain <= 0:
+                self._drain_commands()
+                return
+            self._wake.wait(timeout=min(remain, 0.5))
+            self._wake.clear()
+            if self._drain_commands() == "capture_now":
+                return
+
+    def _drain_commands(self) -> str | None:
+        """应用所有待处理命令；返回'capture_now'表示要求立即跑一轮"""
+        acted = None
+        while True:
+            try:
+                cmd = self.command_q.get_nowait()
+            except queue.Empty:
+                return acted
+            ctype = cmd.get("type")
+            if ctype == "capture_now":
+                print("⚡ 命令: 立即采集")
+                acted = "capture_now"
+            elif ctype == "set_interval":
+                sec = max(1.0, float(cmd.get("seconds", self._interval)))
+                with self._lock:
+                    self._interval = sec
+                print(f"⚡ 命令: 采集间隔 → {sec}s")
+            elif ctype == "pause":
+                self._paused = True
+                print("⚡ 命令: 暂停采集")
+            elif ctype == "resume":
+                self._paused = False
+                print("⚡ 命令: 恢复采集")
+            elif ctype is not None:
+                print(f"⚡ 未知命令: {cmd}")
+
+
+# ============================ HTTP/WS 服务 ============================
+
+def build_app(engine: MonitorEngine):
+    """构建aiohttp应用：REST只读接口 + /ws双向通道
+
+    跨线程事件投递：引擎线程on_event → loop.call_soon_threadsafe把消息
+    放进每个客户端的asyncio.Queue（由各自的sender任务发出去）。
+    """
+    from aiohttp import web, WSMsgType
+
+    app = web.Application()
+    app["clients"] = set()          # 各ws客户端的asyncio.Queue
+
+    def _dispatch(msg: dict):
+        for q in list(app["clients"]):
+            q.put_nowait(msg)
+
+    def _emit(msg: dict):           # 引擎线程调用
+        loop = app["loop"]
+        loop.call_soon_threadsafe(_dispatch, msg)
+
+    async def _on_startup(app):
+        app["loop"] = asyncio.get_running_loop()
+
+    async def _status(request):
+        return web.json_response(engine.snapshot())
+
+    async def _history(request):
+        limit = int(request.query.get("limit", 20))
+        return web.json_response(engine.history(limit))
+
+    async def _healthz(request):
+        return web.json_response({"ok": True})
+
+    async def _index(request):
+        return web.json_response({
+            "service": "camera-vlm-monitor",
+            "endpoints": ["GET /api/status", "GET /api/history?limit=20",
+                          "GET /healthz", "GET /ws"],
+        })
+
+    async def _sender(ws, q: asyncio.Queue):
+        """把队列里的引擎事件推给客户端（独立任务，与读循环并发）"""
+        try:
+            while True:
+                msg = await q.get()
+                await ws.send_json(msg)
+        except asyncio.CancelledError:
+            pass
+
+    async def _ws_handler(request):
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        q: asyncio.Queue = asyncio.Queue()
+        app["clients"].add(q)
+        sender = asyncio.create_task(_sender(ws, q))
+        peer = request.remote
+        print(f"🔗 WS客户端接入: {peer} (共{len(app['clients'])})")
+        try:
+            await ws.send_json({"type": "hello", **engine.snapshot()})
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                try:
+                    cmd = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await ws.send_json({"type": "error", "error": "非法JSON"})
+                    continue
+                ctype = cmd.get("type")
+                if ctype == "ping":
+                    await ws.send_json({"type": "pong"})
+                elif ctype in ("capture_now", "set_interval", "pause", "resume"):
+                    engine.submit(cmd)
+                else:
+                    await ws.send_json({"type": "error",
+                                        "error": f"未知命令: {ctype}"})
+        finally:
+            app["clients"].discard(q)
+            sender.cancel()
+            print(f"🔌 WS客户端断开: {peer} (剩{len(app['clients'])})")
+        return ws
+
+    app.on_startup.append(_on_startup)
+    app.router.add_get("/", _index)
+    app.router.add_get("/api/status", _status)
+    app.router.add_get("/api/history", _history)
+    app.router.add_get("/healthz", _healthz)
+    app.router.add_get("/ws", _ws_handler)
+    app["engine"] = engine
+    app["emit"] = _emit
+    return app
+
+
 def main():
-    parser = argparse.ArgumentParser(description="摄像头定时采集 + VLM 分析")
+    parser = argparse.ArgumentParser(description="摄像头定时采集 + VLM 分析服务")
     parser.add_argument("--config", "-c", default="monitor_config.json",
                         help="配置文件路径 (默认: monitor_config.json)")
     parser.add_argument("--interval", "-i", type=float, default=None,
@@ -287,6 +696,10 @@ def main():
                         help="覆盖配置的摄像头设备号")
     parser.add_argument("--once", action="store_true",
                         help="只采集分析一次后退出(测试用)")
+    parser.add_argument("--no-serve", action="store_true",
+                        help="不起HTTP/WS服务，纯CLI循环(原行为)")
+    parser.add_argument("--host", default=None, help="覆盖监听地址")
+    parser.add_argument("--port", type=int, default=None, help="覆盖监听端口")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -300,135 +713,46 @@ def main():
         config["vlm"]["url"] = args.url
     if args.device is not None:
         config["camera"]["device"] = args.device
+    if args.host is not None:
+        config["server"]["host"] = args.host
+    if args.port is not None:
+        config["server"]["port"] = args.port
 
-    cam_cfg = config["camera"]
-    cap_cfg = config["capture"]
-    vlm_cfg = config["vlm"]
+    serve = not args.no_serve and not args.once
+    engine = MonitorEngine(config, once=args.once)
 
-    output_dir = Path(cap_cfg["output_dir"])
-    if cap_cfg["save_image"]:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    if not serve:
+        engine.run()          # 纯CLI：主线程直接跑（原行为）
+        return
 
-    print("=" * 60)
-    print("🤖 摄像头定时采集 + VLM 分析")
-    print("=" * 60)
-    print(f"📍 服务器: {vlm_cfg['url']}")
-    print(f"⏱️  采集间隔: {cap_cfg['interval']}s")
-    print(f"💭 Prompt: {vlm_cfg['prompt']}")
-    print(f"📁 图片保存: {output_dir if cap_cfg['save_image'] else '(不保存)'}")
-    print("=" * 60)
-
-    cap = open_camera(cam_cfg)
-    log_file = output_dir / f"analysis_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    cycle = 0
-    fail_count = 0
-    status_counts = {"工作": 0, "摸鱼": 0, "离开": 0}
-
+    # 服务模式：引擎线程 + aiohttp主线程
     try:
-        while True:
-            cycle += 1
-            loop_start = time.time()
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            print(f"\n--- 第 {cycle} 次采集 [{timestamp}] ---")
+        from aiohttp import web
+    except ImportError:
+        print("❌ 服务模式需要 aiohttp: pip install aiohttp")
+        print("   （或用 --no-serve 跑纯CLI模式）")
+        sys.exit(1)
 
-            # 1. 采集
-            frame = capture_frame(cap, cam_cfg["warmup_frames"])
-            if frame is None:
-                fail_count += 1
-                print(f"❌ 采集失败 (连续第 {fail_count} 次)")
-                # 连续失败 3 次则重开摄像头(应对USB松动/设备占用)
-                if fail_count >= 3:
-                    print("🔄 尝试重新打开摄像头...")
-                    cap.release()
-                    time.sleep(2)
-                    try:
-                        cap = open_camera(cam_cfg)
-                        fail_count = 0
-                    except SystemExit:
-                        print("   重开失败，等待下一轮再试")
-                        fail_count = 2
-                with open(log_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"timestamp": timestamp, "cycle": cycle,
-                                        "status": None, "error": "采集失败"},
-                                       ensure_ascii=False) + "\n")
-            else:
-                fail_count = 0
-                image_path = None
-                if cap_cfg["save_image"]:
-                    image_path = output_dir / f"img_{timestamp}.jpg"
-                    cv2.imwrite(str(image_path), frame)
-                    print(f"📸 已保存: {image_path}")
+    app = build_app(engine)
+    engine.on_event = app["emit"]
+    engine.start()
 
-                # 2. 分析
-                try:
-                    data_url, side = frame_to_data_url(frame, vlm_cfg["max_side"])
-                    print(f"📤 发送分析请求 (长边 {side}px)...")
-                    result = analyze_with_retry(data_url, vlm_cfg["prompt"], vlm_cfg)
-
-                    content = result["choices"][0]["message"]["content"]
-                    usage = result.get("usage", {})
-                    elapsed = result["_elapsed"]
-                    tokens = usage.get("completion_tokens", 0)
-                    tps = tokens / elapsed if elapsed > 0 else 0
-
-                    # 解析工作状态
-                    status = parse_status(content)
-                    if status:
-                        status_counts[status] += 1
-                        emoji = STATUS_EMOJI.get(status, "")
-                        print(f"\n{emoji} 状态判定: 【{status}】")
-                    else:
-                        print("\n⚠️  未能解析状态")
-
-                    print(f"💬 分析结果:\n{content}")
-                    print(f"⏱️  {elapsed:.2f}s | {tokens} tokens | {tps:.1f} tok/s")
-
-                    # 3. 记录到日志
-                    record = {
-                        "timestamp": timestamp,
-                        "cycle": cycle,
-                        "status": status,
-                        "image": str(image_path) if image_path else None,
-                        "prompt": vlm_cfg["prompt"],
-                        "response": content,
-                        "elapsed": round(elapsed, 2),
-                        "usage": usage,
-                    }
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-                except Exception as e:
-                    # 任何错误都不终止监控，等待下一轮
-                    print(f"❌ 分析失败: {type(e).__name__}: {e}")
-                    print("   (继续下一轮采集)")
-                    # 失败也记入日志，保证时间线连续可查
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"timestamp": timestamp, "cycle": cycle,
-                                            "status": None, "error": str(e)},
-                                           ensure_ascii=False) + "\n")
-
-            if args.once:
-                break
-
-            # 4. 定期清理旧图片(时间+数量双上限)
-            interval_cycles = max(1, config["storage"]["cleanup_interval_cycles"])
-            if cycle % interval_cycles == 0:
-                try:
-                    cleanup_images(output_dir, config["storage"])
-                except OSError as e:
-                    print(f"⚠️ 图片清理出错(不影响监控): {e}")
-
-            # 5. 按固定间隔调度(扣除处理耗时)
-            remaining = cap_cfg["interval"] - (time.time() - loop_start)
-            if remaining > 0:
-                print(f"😴 等待 {remaining:.1f}s 后进行下次采集...")
-                time.sleep(remaining)
-
+    srv_cfg = config["server"]
+    print("=" * 60)
+    print("🤖 摄像头定时采集 + VLM 分析服务")
+    print("=" * 60)
+    print(f"📍 VLM服务器: {config['vlm']['url']}")
+    print(f"⏱️  采集间隔: {config['capture']['interval']}s")
+    print(f"🌐 HTTP/WS: http://{srv_cfg['host']}:{srv_cfg['port']}"
+          f" (/api/status /api/history /ws)")
+    print("=" * 60)
+    try:
+        web.run_app(app, host=srv_cfg["host"], port=srv_cfg["port"],
+                    print=None)
     except KeyboardInterrupt:
-        print("\n🛑 用户中断，退出")
+        pass
     finally:
-        cap.release()
-        print_summary(status_counts, log_file)
+        engine.stop()
 
 
 if __name__ == "__main__":
